@@ -1,119 +1,222 @@
 #!/usr/bin/env python3
 
+import datetime
+import getopt
+import pickle
+import queue
 import sys
 import socket
 import threading
-import pickle
-from threading import Thread
-from os import system as cmd
+import os
 
-version = "2.4.0"
-# Process exits cleanly when all queues are empty
-# slight regression, moved from multiprocessing.connections to sockets
-# possibly dangerous use of sockets
-# possibly dangerous use of threads
+version = "3.0.0-1"
 
+usage = "Usage: cqueue.py [options] <queue_name> <command>"
 
-# global stuff
+# global variables
+verbose = False
 queue_list = []
 exit_event = threading.Event()
-
+log_file = open('/tmp/cqueue_debug.log', 'w')
 
 def main():
-    #sys.argv.extend((1, "echo test1; sleep 10; echo test2"))
+    try:
+        options, remaining_args = getopt.gnu_getopt(sys.argv[1:], "vh", ["help","keep-all"])
+    except getopt.GetoptError as error:
+        print(error)
+        sys.exit(2)
 
-    if len(sys.argv) < 3:
-        print("usage: cqueue.py <queue num> <command>")
-        return
+    for opt, arg in options:
+        if opt == '-h':
+            print(usage)
+            sys.exit(2)
+        elif opt == '-v':
+            global verbose
+            verbose = True
 
-    queue_num = sys.argv[1]
-    command = sys.argv[2]
+    if len(remaining_args) == 1:
+        queue_name = None
+        command = remaining_args[0]
+    elif len(remaining_args) > 1:
+        queue_name = remaining_args[0]
+        command = ' '.join(remaining_args[1:]) #the rest
+    else:
+        print("Missing arguments")
+        print(usage)
+        sys.exit(2)
+
+    if verbose:
+        if queue_name is not None: print(f"Queue name: '{queue_name}'")
+        print(f"Command: '{command}'")
 
     uds_address = '\0' + 'uds_socket'  # Create UDS file in abstract space
 
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        if bind(sock, uds_address):
-            process_input(queue_num, command)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if bind(sock, uds_address):
+        if queue_name is None:
+            print("Client command passed to server. exiting.")
+            sys.exit(2)
 
-            Thread(target=receive, args=(sock,), daemon=True).start()
-            exit_event.wait()
-        else:
-            send(sock, uds_address, queue_num, command)
+        # Create a daemon that runs the command (cqueue returns immediately)
+        sock.close()
+        pid1 = os.fork()
+        if pid1 == 0:
+            os.setsid()
+            os.chdir("/")
+            os.umask(0)
+            pid2 = os.fork()
+            if pid2 == 0:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                server(sock, uds_address, queue_name, command)
+        os._exit(0)
+    else:
+        client(sock, uds_address, queue_name, command)
+
+
+
+
+def client(sock, address, queue_name, command):
+    sock.connect(address)
+    print(f"Sending command '{command}' to job server")
+    if queue_name is not None:
+        send(sock, (queue_name, command))
+    elif command == "list":
+        send(sock, (None, command))
+        data = receive(sock)
+        print(data)
+
+
+
+def server(sock, address, queue_name, command):
+    log("Starting job server")
+    
+    try:
+        sock.bind(address)
+        log("Bound job server to socket.")
+    except socket.error:
+        log("Error binding job server to socket")
+        sys.exit(2)
+    sock.listen()
+
+    process_job(queue_name, command)
+
+    while not exit_event.is_set():
+        log("Waiting to recieve command")
+        csock = sock.accept()[0]
+        (queue_name, command) = receive(csock)
+        
+        if queue_name is not None:
+            process_job(queue_name, command)
+        elif command == "list":
+            data = ""
+            for queue in queue_list:
+                data += f"Queue '{queue.name()}':\n"
+                jobs = queue.jobs()
+                data += f"#0 - '{jobs[0]}' (executing)\n"
+                for idx, job in enumerate(jobs[1:], start=1):
+                    data += f"#{idx} - '{job}'\n"
+            send(csock, data)
+    sock.close()
+
+
+
+def process_job(queue_name, command):
+    # if queue list does not contain a queue with num 'queue_name' make it
+    if any(queue.name() == queue_name for queue in queue_list):
+        log(f"Queue '{queue_name}' exists.")
+        queue = next((q for q in queue_list if q.name() == queue_name), None)
+        queue.add_job(command)
+    else:
+        log(f"Queue '{queue_name}' does not exist. Creating new")
+        queue = Command_Queue(queue_name, command)
+        queue_list.append(queue)
 
 
 def bind(sock, socket_address):
     try:
         sock.bind(socket_address)
-        print("Bound socket.")
+        log("Bound socket.")
         return True
     except socket.error:
-        print("Socket already exists")
+        log("Socket already exists")
         return False
 
 
-def send(sock, address, queue_num, command):
-    sock.connect(address)
-    data = (queue_num, command)
+def server_status(sock, address):
+    send(sock, address, "status")
+    response = receive(sock)
+    datarecv = sock.recv(4096)
+    datar = pickle.loads(datarecv)
+
+
+
+
+### Network
+
+def send(sock, data):
+    log('Sending data')
     byte_data = pickle.dumps(data, -1)
     sock.sendall(byte_data)
 
 
 def receive(sock):
-    sock.listen()
-    while True:
-        conn = sock.accept()[0]
-        print('receiving new job')
-        byte_data = conn.recv(4096)
-        data = pickle.loads(byte_data)
-        process_input(data[0], data[1])
-        conn.close()
+    log('Receiving data')
+    byte_data = sock.recv(4096)
+    data = pickle.loads(byte_data)
+    return data
+
+###
 
 
-def process_input(queue_num, command):
-    # if queue list does not contain a queue with num 'queue_num' make it
-    if any(queue.serial() == queue_num for queue in queue_list):
-        queue = next((q for q in queue_list if q.serial() == queue_num), None)
-        queue.add_job(command)
-    else:
-        queue = Queue(queue_num, command)
-        queue_list.append(queue)
 
+class Command_Queue:
+    def __init__(self, name, command):
+        self.__name = name
+        self.__job_queue = queue.Queue()  # a list of jobs (commands)
+        self.executing = None
+        self.add_job(command)
 
-def attempt_exit():
-    print("Queue empty, attempting exit.")
-    if not any(queue_list):
-        print("No jobs queued, exiting.")
-        exit_event.set()
-    else:
-        print("Cannot exit, active queues remaining")
+        # create and start a thread for this queue object
+        threading.Thread(target=self.run).start()
 
-
-class Queue:
     def run(self):
         while True:
-            if any(self.__job_queue):
-                command = self.__job_queue.pop(0)
-                print(f"Executing command: {command}")
-                cmd(command)
+            if not self.__job_queue.empty():
+                self.executing = self.__job_queue.get()
+                log(f"Executing command: {self.executing}")
+                os.system(self.executing)
             else:
                 queue_list.remove(self)
                 attempt_exit()
                 return
 
-    def __init__(self, serial, command):
-        self.__serial = serial
-        self.__job_queue = []  # a list of jobs
-        self.add_job(command)
-
-        # create and start a thread for this queue object
-        Thread(target=self.run).start()
-
     def add_job(self, command):
-        self.__job_queue.append(command)
+        try:
+            self.__job_queue.put(command)
+        except queue.Full:
+            log(f"Cannot add job, queue '{self.__name}' is full")
 
-    # Accessors
-    def serial(self):
-        return self.__serial
 
+    def name(self):
+        return self.__name
+
+    def jobs(self):
+        return [self.executing] + list(self.__job_queue.queue)
+
+
+def attempt_exit():
+    log("Queue empty, attempting exit.")
+    if not any(queue_list):
+        log("No jobs queued, exiting.")
+        exit_event.set()
+    else:
+        log("Cannot exit, active queues remaining")
+
+
+def log(message):
+    if verbose:
+        time = datetime.datetime.now().strftime("%Y%m%d::%H:%M:%S")
+        log_file.write(f"{time} - {message}\n")
+        log_file.flush()
 
 main()
