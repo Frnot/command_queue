@@ -9,7 +9,7 @@ import socket
 import threading
 import os
 
-version = "3.0.0-1"
+version = "3.0.1-1"
 
 usage = "Usage: cqueue.py [options] <queue_name> <command>"
 
@@ -77,7 +77,7 @@ def main():
 
 def client(sock, address, queue_name, command):
     sock.connect(address)
-    print(f"Sending command '{command}' to job server")
+    if verbose: print(f"Sending command '{command}' to job server")
     if queue_name is not None:
         send(sock, (queue_name, command))
     elif command == "list":
