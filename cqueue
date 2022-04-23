@@ -13,7 +13,7 @@ import threading
 import time
 
 
-version = "4.0.2b1"
+version = "4.0.5"
 
 help = """
 commands:
@@ -197,7 +197,7 @@ def server_status():
         jobs = queue.valid_jobs()
         data += f"#0 - '{jobs[0]}' (executing)\n"
         for idx, job in enumerate(jobs[1:], start=1):
-            data += f"#{idx} - '{job.command}'\n"
+            data += f"#{idx} - '{job}'\n"
     return data
 
 def stop():
@@ -287,7 +287,7 @@ class Command_Queue:
         vjobs = [self.executing]
         for job in list(self.__job_queue.queue):
             if job.is_valid():
-                vjobs.append(job)
+                vjobs.append(job.command)
         return vjobs
 
 
