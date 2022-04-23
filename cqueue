@@ -5,6 +5,7 @@ import datetime
 import os
 import pickle
 import queue
+import signal
 import socket
 import subprocess
 import sys
@@ -264,7 +265,7 @@ class Command_Queue:
                 if job.is_valid():
                     self.executing = job.command
                     log(f"Executing command: {self.executing}")
-                    self.proc = subprocess.Popen(self.executing, shell=True)
+                    self.proc = subprocess.Popen(self.executing, shell=True, preexec_fn=os.setsid)
                     self.proc.wait()
             else:
                 queue_list.remove(self)
@@ -292,7 +293,8 @@ class Command_Queue:
 
     def skip(self):
         log(f"Skipping job '{self.executing}' on queue '{self.__name}'")
-        self.proc.terminate()
+        #self.proc.terminate()
+        os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
 
     def clear(self):
         log(f"Clearing job queue '{self.__name}'")
@@ -302,7 +304,8 @@ class Command_Queue:
     def terminate(self):
         log(f"Terminating queue '{self.__name}' thread")
         self.term_event.set()
-        self.proc.terminate()
+        #self.proc.terminate()
+        os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
 
 
 
