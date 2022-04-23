@@ -13,7 +13,7 @@ import threading
 import time
 
 
-version = "4.0.5"
+version = "4.0.6"
 
 help = """
 commands:
@@ -44,8 +44,8 @@ def main():
 
     args = parser.parse_args()
 
-    queue_name = args.queue_name.lower()
-    command = ' '.join(args.command).lower()
+    queue_name = args.queue_name
+    command = ' '.join(args.command)
     if not args.command:
         command = queue_name
         queue_name = None
@@ -69,7 +69,7 @@ def main():
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     if bind(sock, uds_address): # if we can bind to the socket, no one is listening
-        if command in client_command_list:
+        if command.lower() in client_command_list:
             print("Job server is not running (queue is empty). exiting.")
             sys.exit(2)
 
@@ -111,7 +111,7 @@ def bind(sock, socket_address):
 def client(sock, address, queue_name, command, options):
     sock.connect(address)
     if verbose: print(f"Sending command '{command}' to job server")
-    if command not in client_command_list:
+    if command.lower() not in client_command_list:
         send(sock, (queue_name, command, options))
     else:
         send(sock, (queue_name, command, options))
@@ -140,7 +140,7 @@ def server(sock, address, queue_name, command, options):
         if command == "TERM": return
         log(f"Received command '{command}' for queue '{queue_name}' options: {options}")
 
-
+        command = command.lower()
         if command not in client_command_list:
             process_job(queue_name, command, options)
 
