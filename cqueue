@@ -1,61 +1,82 @@
 #!/usr/bin/env python3
 
+import argparse
 import datetime
-import getopt
+import os
 import pickle
 import queue
-import sys
 import socket
+import subprocess
+import sys
 import threading
-import os
+import time
 
-version = "3.0.1-1"
 
-usage = "Usage: cqueue.py [options] <queue_name> <command>"
+version = "4.0.2b1"
+
+help = """
+commands:
+  status         Prints a list of the currently running and queued jobs
+  stop           Immediately terminates the current running job and clears the queue
+  skip           Immediately terminates the current running job and continues the queue
+  clear          Clears the queue
+"""
 
 # global variables
-verbose = False
+verbose = True
+debug = False
 queue_list = []
 exit_event = threading.Event()
-log_file = open('/tmp/cqueue_debug.log', 'w')
+log_file = open(f"/tmp/cqueue.log", 'w')
+client_command_list = ("status", "list", "stop", "skip", "clear")
+
 
 def main():
-    try:
-        options, remaining_args = getopt.gnu_getopt(sys.argv[1:], "vh", ["help","keep-all"])
-    except getopt.GetoptError as error:
-        print(error)
-        sys.exit(2)
+    parser = argparse.ArgumentParser(description = help, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("queue_name")
+    parser.add_argument("command", nargs='*')
 
-    for opt, arg in options:
-        if opt == '-h':
-            print(usage)
-            sys.exit(2)
-        elif opt == '-v':
-            global verbose
-            verbose = True
+    parser.add_argument("-q", "--quiet", dest="verbose", action="store_false", help="Do not log debug messages")
+    parser.add_argument("-m", "--max", default=2, dest="max", type=int, help="Set max number of allowed duplicate events in queue (0 to disable)")
+    parser.add_argument("-t", "--ttl", default=0, dest="ttl", help="Set time (in seconds) job will remain in queue before expiring (0 to disable)")
+    parser.add_argument("-d", "--debug", dest="debug", action="store_true", help="Server will not daemonize")
 
-    if len(remaining_args) == 1:
+    args = parser.parse_args()
+
+    queue_name = args.queue_name.lower()
+    command = ' '.join(args.command).lower()
+    if not args.command:
+        command = queue_name
         queue_name = None
-        command = remaining_args[0]
-    elif len(remaining_args) > 1:
-        queue_name = remaining_args[0]
-        command = ' '.join(remaining_args[1:]) #the rest
-    else:
-        print("Missing arguments")
-        print(usage)
-        sys.exit(2)
 
+    global verbose
+    verbose = args.verbose
+    global debug
+    debug = args.debug
+    options = {
+        "max": args.max,
+        "ttl": args.ttl
+    }
+
+    if debug: print("Debug on")
     if verbose:
         if queue_name is not None: print(f"Queue name: '{queue_name}'")
         print(f"Command: '{command}'")
 
-    uds_address = '\0' + 'uds_socket'  # Create UDS file in abstract space
+
+    uds_address = '\0' + 'cqueue_uds_socket'  # Create UDS file in abstract space
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    if bind(sock, uds_address):
-        if queue_name is None:
-            print("Client command passed to server. exiting.")
+    if bind(sock, uds_address): # if we can bind to the socket, no one is listening
+        if command in client_command_list:
+            print("Job server is not running (queue is empty). exiting.")
             sys.exit(2)
+
+        if debug:
+            print("Running server in this terminal")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server(sock, uds_address, queue_name, command, options)
+            return
 
         # Create a daemon that runs the command (cqueue returns immediately)
         sock.close()
@@ -67,69 +88,12 @@ def main():
             pid2 = os.fork()
             if pid2 == 0:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                server(sock, uds_address, queue_name, command)
+                server(sock, uds_address, queue_name, command, options)
         os._exit(0)
     else:
-        client(sock, uds_address, queue_name, command)
+        client(sock, uds_address, queue_name, command, options)
 
 
-
-
-def client(sock, address, queue_name, command):
-    sock.connect(address)
-    if verbose: print(f"Sending command '{command}' to job server")
-    if queue_name is not None:
-        send(sock, (queue_name, command))
-    elif command == "list":
-        send(sock, (None, command))
-        data = receive(sock)
-        print(data)
-
-
-
-def server(sock, address, queue_name, command):
-    log("Starting job server")
-    
-    try:
-        sock.bind(address)
-        log("Bound job server to socket.")
-    except socket.error:
-        log("Error binding job server to socket")
-        sys.exit(2)
-    sock.listen()
-
-    process_job(queue_name, command)
-
-    while not exit_event.is_set():
-        log("Waiting to recieve command")
-        csock = sock.accept()[0]
-        (queue_name, command) = receive(csock)
-        
-        if queue_name is not None:
-            process_job(queue_name, command)
-        elif command == "list":
-            data = ""
-            for queue in queue_list:
-                data += f"Queue '{queue.name()}':\n"
-                jobs = queue.jobs()
-                data += f"#0 - '{jobs[0]}' (executing)\n"
-                for idx, job in enumerate(jobs[1:], start=1):
-                    data += f"#{idx} - '{job}'\n"
-            send(csock, data)
-    sock.close()
-
-
-
-def process_job(queue_name, command):
-    # if queue list does not contain a queue with num 'queue_name' make it
-    if any(queue.name() == queue_name for queue in queue_list):
-        log(f"Queue '{queue_name}' exists.")
-        queue = next((q for q in queue_list if q.name() == queue_name), None)
-        queue.add_job(command)
-    else:
-        log(f"Queue '{queue_name}' does not exist. Creating new")
-        queue = Command_Queue(queue_name, command)
-        queue_list.append(queue)
 
 
 def bind(sock, socket_address):
@@ -142,11 +106,122 @@ def bind(sock, socket_address):
         return False
 
 
-def server_status(sock, address):
-    send(sock, address, "status")
-    response = receive(sock)
-    datarecv = sock.recv(4096)
-    datar = pickle.loads(datarecv)
+
+def client(sock, address, queue_name, command, options):
+    sock.connect(address)
+    if verbose: print(f"Sending command '{command}' to job server")
+    if command not in client_command_list:
+        send(sock, (queue_name, command, options))
+    else:
+        send(sock, (queue_name, command, options))
+        data = receive(sock)
+        print(data)
+
+
+
+def server(sock, address, queue_name, command, options):
+    log("Starting job server")
+
+    try:
+        sock.bind(address)
+        log("Bound job server to socket.")
+    except socket.error:
+        log("Error binding job server to socket")
+        sys.exit(2)
+    sock.listen()
+
+    process_job(queue_name, command, options)
+
+    while not exit_event.is_set():
+        log("Waiting to receive command")
+        csock = sock.accept()[0] # this will block from exiting
+        (queue_name, command, options) = receive(csock)
+        if command == "TERM": return
+        log(f"Received command '{command}' for queue '{queue_name}' options: {options}")
+
+
+        if command not in client_command_list:
+            process_job(queue_name, command, options)
+
+        # Client commands
+        elif command in ("status", "list"):
+            data = server_status()
+            send(csock, data)
+        elif command == "stop":
+            data = "Attempting to clear all queues and exit"
+            send(csock, data)
+            stop()
+        elif command == "skip":
+            data = skip(queue_name)
+            send(csock, data)
+        elif command == "clear":
+            data = clear(queue_name)
+            send(csock, data)
+
+    sock.close()
+
+
+
+def process_job(queue_name, command, options):
+    ttl = options["ttl"]
+    max = options["max"]
+
+    # if queue list does not contain a queue with num 'queue_name' make it
+    if any(queue.name() == queue_name for queue in queue_list):
+        log(f"Queue '{queue_name}' exists.")
+        queue = next((q for q in queue_list if q.name() == queue_name), None)
+
+        # check queue for jobs with idential command
+        command_count = 0
+        for job in queue.valid_jobs():
+            if job == command: command_count +=1
+        # add new job only if currently queued job occurance does not exceed 'max'
+        if command_count < max:
+            log(f"Adding job '{command}'")
+            queue.add_job(command, ttl)
+        else:
+            log(f"Occurence of '{command}' in queue '{queue_name}' would exceed specified max ({max}). Skipping job")
+    else:
+        log(f"Queue '{queue_name}' does not exist. Creating new")
+        queue = Command_Queue(queue_name, command, ttl)
+        queue_list.append(queue)
+
+
+
+### Function Commands
+def server_status():
+    data = ""
+    for queue in queue_list:
+        data += f"Queue '{queue.name()}':\n"
+        jobs = queue.valid_jobs()
+        data += f"#0 - '{jobs[0]}' (executing)\n"
+        for idx, job in enumerate(jobs[1:], start=1):
+            data += f"#{idx} - '{job.command}'\n"
+    return data
+
+def stop():
+    for queue in queue_list:
+        queue.terminate()
+        queue_list.remove(queue)
+    exit_event.set()
+
+def skip(queue_name):
+    if queue_name is None:
+        return "Error: 'skip' command requires a queue_name argument"
+    if not any(queue.name() == queue_name for queue in queue_list):
+        return f"Error: no queue with name '{queue_name}' was found."
+    queue = next((q for q in queue_list if q.name() == queue_name), None)
+    queue.skip()
+    return f"Terminated executing job for queue '{queue_name}'"
+
+def clear(queue_name):
+    if queue_name is None:
+        return "Error: 'clear' command requires a queue_name argument"
+    if not any(queue.name() == queue_name for queue in queue_list):
+        return f"Error: no queue with name '{queue_name}' was found."
+    queue = next((q for q in queue_list if q.name() == queue_name), None)
+    queue.clear()
+    return f"Cleared all jobs from queue '{queue_name}'"
 
 
 
@@ -170,29 +245,36 @@ def receive(sock):
 
 
 class Command_Queue:
-    def __init__(self, name, command):
+    def __init__(self, name, command, ttl):
         self.__name = name
+        self.proc = None
+        self.term_event = threading.Event()
         self.__job_queue = queue.Queue()  # a list of jobs (commands)
         self.executing = None
-        self.add_job(command)
+        self.add_job(command, ttl)
 
         # create and start a thread for this queue object
         threading.Thread(target=self.run).start()
 
+
     def run(self):
-        while True:
+        while not self.term_event.is_set():
             if not self.__job_queue.empty():
-                self.executing = self.__job_queue.get()
-                log(f"Executing command: {self.executing}")
-                os.system(self.executing)
+                job = self.__job_queue.get()
+                if job.is_valid():
+                    self.executing = job.command
+                    log(f"Executing command: {self.executing}")
+                    self.proc = subprocess.Popen(self.executing, shell=True)
+                    self.proc.wait()
             else:
                 queue_list.remove(self)
                 attempt_exit()
                 return
 
-    def add_job(self, command):
+    def add_job(self, command, ttl):
         try:
-            self.__job_queue.put(command)
+            job = Job(command, ttl)
+            self.__job_queue.put(job)
         except queue.Full:
             log(f"Cannot add job, queue '{self.__name}' is full")
 
@@ -200,23 +282,67 @@ class Command_Queue:
     def name(self):
         return self.__name
 
-    def jobs(self):
-        return [self.executing] + list(self.__job_queue.queue)
+    def valid_jobs(self):
+        vjobs = [self.executing]
+        for job in list(self.__job_queue.queue):
+            if job.is_valid():
+                vjobs.append(job)
+        return vjobs
 
 
+    def skip(self):
+        log(f"Skipping job '{self.executing}' on queue '{self.__name}'")
+        self.proc.terminate()
+
+    def clear(self):
+        log(f"Clearing job queue '{self.__name}'")
+        while not self.__job_queue.empty():
+            self.__job_queue.get()
+
+    def terminate(self):
+        log(f"Terminating queue '{self.__name}' thread")
+        self.term_event.set()
+        self.proc.terminate()
+
+
+
+class Job:
+    def __init__(self, command, ttl):
+        self.command = command
+        self.exp_time = time.time() + ttl
+        self.nostale = ttl == 0
+
+    def is_valid(self):
+        if self.nostale:
+            return True
+        else:
+            return self.exp_time > time.time()
+
+
+
+# This attempts to exit the main server loop
 def attempt_exit():
     log("Queue empty, attempting exit.")
-    if not any(queue_list):
+    if any(queue_list):
+        log("Cannot exit, active queues remaining")
+    else:
         log("No jobs queued, exiting.")
         exit_event.set()
-    else:
-        log("Cannot exit, active queues remaining")
+
+        uds_address = '\0' + 'cqueue_uds_socket'
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(uds_address)
+        send(sock, (None, "TERM", None))
 
 
-def log(message):
+
+def log(message): # TODO: This probably isn't thread safe
+    time = datetime.datetime.now().strftime("%Y%m%d::%H:%M:%S")
+
     if verbose:
-        time = datetime.datetime.now().strftime("%Y%m%d::%H:%M:%S")
         log_file.write(f"{time} - {message}\n")
         log_file.flush()
+    if debug:
+        print(f"{time} - {message}")
 
 main()
