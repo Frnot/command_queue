@@ -12,7 +12,7 @@ import threading
 import time
 import logging
 
-version = "4.2.0"
+version = "4.2.1"
 
 help = """
 commands:
@@ -166,6 +166,8 @@ def client(sock, address, queue_name, command, options):
             if command.lower() in client_command_list:
                 data = receive(sock)
                 logger.info(data)
+            sock.close()
+            break
         except ConnectionRefusedError:
             if attempt < max_retries:
                 logger.debug(f"Connection refused. Retrying... ({attempt}/{max_retries})")
@@ -393,4 +395,3 @@ def attempt_exit():
         send(sock, (None, "TERM", None))
 
 main()
-
